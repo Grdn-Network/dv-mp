@@ -38,6 +38,7 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
 
     private void Server_OnTick(uint tick)
     {
+        long perfTickSet = GrdnPerf.Begin();
 
         cachedSendPacket.Tick = tick;
         foreach (Trainset set in Trainset.allSets)
@@ -50,6 +51,8 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
             else
                 Multiplayer.LogWarning($"Server_OnTick(): Trainset or cars are null. Set Id: {set?.id}, Cars: {set?.cars?.Count}");
         }
+
+        GrdnPerf.End(GrdnPerf.Section.ServerTickSet, perfTickSet);
     }
 
     private void Server_TickSet(Trainset set, uint tick)
@@ -79,6 +82,9 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
         // Car may not be initialised, missing a valid NetID
         if (cachedSendPacket.FirstNetId == 0 || cachedSendPacket.LastNetId == 0)
             return;
+
+        GrdnPerf.Count(GrdnPerf.Counter.SetsWalked);
+        GrdnPerf.Add(GrdnPerf.Counter.CarsChecked, set.cars.Count);
 
         foreach (TrainCar trainCar in set.cars)
         {
@@ -192,6 +198,9 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
         }
 
         cachedSendPacket.TrainsetParts = trainsetParts;
+        GrdnPerf.Count(GrdnPerf.Counter.PhysicsPacketsSent);
+        if (maxTicksReached)
+            GrdnPerf.Count(GrdnPerf.Counter.FullSyncSends);
         NetworkLifecycle.Instance.Server.SendTrainsetPhysicsUpdate(cachedSendPacket, anyTracksDirty);
     }
     #endregion
@@ -205,12 +214,14 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
 
         if (set == null)
         {
+            GrdnPerf.Count(GrdnPerf.Counter.UnknownTrainset);
             Multiplayer.LogWarning($"Received {nameof(ClientboundTrainsetPhysicsPacket)} for unknown trainset with FirstNetId: {packet.FirstNetId} and LastNetId: {packet.LastNetId}");
             return;
         }
 
         if (set.cars.Count != packet.TrainsetParts.Length)
         {
+            GrdnPerf.Count(GrdnPerf.Counter.TrainsetMismatch);
             //log the discrepancies
             Multiplayer.LogWarning(
                 $"Received {nameof(ClientboundTrainsetPhysicsPacket)} for trainset with FirstNetId: {packet.FirstNetId} and LastNetId: {packet.LastNetId} with {packet.TrainsetParts.Length} parts, but trainset has {set.cars.Count} parts");
@@ -220,10 +231,11 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
                 if (NetworkedTrainCar.TryGet(packet.TrainsetParts[i].NetId ,out NetworkedTrainCar networkedTrainCar))
                 {
                     //Multiplayer.LogDebug(()=>$"Applying TrainPhysicsUpdate to {packet.TrainsetParts[i].NetId}");
-                    networkedTrainCar.Client_ReceiveTrainPhysicsUpdate(in packet.TrainsetParts[i], packet.Tick);
+                    networkedTrainCar.Client_ReceiveTrainPhysicsUpdate(in packet.TrainsetParts[i], packet.Tick, fromMismatchFallback: true);
                 }
                 else
                 {
+                    GrdnPerf.Count(GrdnPerf.Counter.UnableToApply);
                     Multiplayer.LogWarning($"Unable to apply TrainPhysicsUpdate to {packet.TrainsetParts[i].NetId}, NetworkedTrainCar not found!");
                 }
             }
@@ -241,7 +253,10 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
             if(set.cars[i].TryNetworked(out NetworkedTrainCar networkedTrainCar))
                 networkedTrainCar.Client_ReceiveTrainPhysicsUpdate(in packet.TrainsetParts[i], packet.Tick);
             else
+            {
+                GrdnPerf.Count(GrdnPerf.Counter.UnableToApply);
                 Multiplayer.LogWarning($"Unable to apply TrainPhysicsUpdate to TrainSet with FirstNetId: {packet.FirstNetId}, NetworkedTrainCar not found!");
+            }
         }
     }
      

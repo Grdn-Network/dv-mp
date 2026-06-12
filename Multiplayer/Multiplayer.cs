@@ -58,6 +58,9 @@ public static class Multiplayer
         ModEntry.OnSaveGUI = Settings.Save;
         ModEntry.OnLateUpdate = LateUpdate;
 
+        Settings.OnSettingsUpdated += Components.Networking.GrdnPerf.ApplySettings;
+        Components.Networking.GrdnPerf.ApplySettings(Settings);
+
         Harmony harmony = null;
 
         try

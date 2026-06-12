@@ -110,6 +110,10 @@ public class Settings : UnityModManager.ModSettings, IDrawable
     public int SimulationMinLatency = 30;
     [Draw("Maximum Latency (ms)", VisibleOn = "SimulateLatency|true")]
     public int SimulationMaxLatency = 100;
+    [Draw("Enable Performance Instrumentation", Tooltip = "Records tick timings, packet counters and sync-anomaly counts to a CSV in the mod folder. Near-zero cost when off.", VisibleOn = "ShowAdvancedSettings|true")]
+    public bool EnablePerfInstrumentation;
+    [Draw("Perf Flush Interval (seconds)", Tooltip = "How often the perf CSV is written.", VisibleOn = "EnablePerfInstrumentation|true")]
+    public int PerfFlushIntervalSec = 10;
     public bool ForceJson = false;
 #if DEBUG
     [Draw("Export Save Data On Load", VisibleOn = "ShowAdvancedSettings|true")]

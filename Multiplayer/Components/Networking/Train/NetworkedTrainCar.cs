@@ -1749,13 +1749,17 @@ public class NetworkedTrainCar : IdMonoBehaviour<ushort, NetworkedTrainCar>
         Client_Initialized = true;
     }
 
-    public void Client_ReceiveTrainPhysicsUpdate(in TrainsetMovementPart movementPart, uint tick)
+    public void Client_ReceiveTrainPhysicsUpdate(in TrainsetMovementPart movementPart, uint tick, bool fromMismatchFallback = false)
     {
         if (!Client_Initialized)
             return;
 
         if (tick <= lastTickProcessed)
         {
+            if (tick == lastTickProcessed)
+                GrdnPerf.Count(fromMismatchFallback ? GrdnPerf.Counter.DupTickFallback : GrdnPerf.Counter.DupTickAligned);
+            else
+                GrdnPerf.Count(GrdnPerf.Counter.TickRegression);
             Multiplayer.LogWarning($"Received physics update for car {CurrentID} at tick {tick}, but last tick processed was {lastTickProcessed}");
             return;
         }
@@ -1825,6 +1829,8 @@ public class NetworkedTrainCar : IdMonoBehaviour<ushort, NetworkedTrainCar>
 
         if (!kinematic)
         {
+            if (TrainCar.rb.isKinematic)
+                GrdnPerf.Count(GrdnPerf.Counter.KinematicResets);
             kinematicCycles = 0;
             TrainCar.rb.isKinematic = kinematic;
         }

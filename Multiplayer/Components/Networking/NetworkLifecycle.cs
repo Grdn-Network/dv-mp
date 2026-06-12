@@ -177,7 +177,9 @@ public class NetworkLifecycle : SingletonBehaviour<NetworkLifecycle>
         {
             Tick++;
             tickTimer.Start();
+            long perfTick = GrdnPerf.Begin();
 
+            long perfOnTick = GrdnPerf.Begin();
             tickWatchdog.Start();
             try
             {
@@ -192,13 +194,18 @@ public class NetworkLifecycle : SingletonBehaviour<NetworkLifecycle>
             finally
             {
                 tickWatchdog.Stop(time => Multiplayer.LogWarning($"OnTick took {time} ms!"));
+                GrdnPerf.End(GrdnPerf.Section.OnTick, perfOnTick);
             }
 
             if (Client != null)
-                TickManager(Client);
+                TickManager(Client, GrdnPerf.Section.PollClient);
 
             if (Server != null)
-                TickManager(Server);
+                TickManager(Server, GrdnPerf.Section.PollServer);
+
+            GrdnPerf.End(GrdnPerf.Section.TickTotal, perfTick);
+            if (GrdnPerf.Enabled)
+                GrdnPerf.CacheTransportStats(Client?.Statistics, Server?.Statistics);
 
             float elapsedTime = tickTimer.Stop();
             float remainingTime = Mathf.Max(0f, TICK_INTERVAL - elapsedTime);
@@ -206,11 +213,12 @@ public class NetworkLifecycle : SingletonBehaviour<NetworkLifecycle>
         }
     }
 
-    private void TickManager(NetworkManager manager)
+    private void TickManager(NetworkManager manager, GrdnPerf.Section perfSection)
     {
         if (manager == null)
             return;
 
+        long perfPoll = GrdnPerf.Begin();
         tickWatchdog.Start();
 
         try
@@ -224,6 +232,7 @@ public class NetworkLifecycle : SingletonBehaviour<NetworkLifecycle>
         finally
         {
             tickWatchdog.Stop(time => manager.LogWarning($"PollEvents took {time} ms!"));
+            GrdnPerf.End(perfSection, perfPoll);
         }
     }
 
