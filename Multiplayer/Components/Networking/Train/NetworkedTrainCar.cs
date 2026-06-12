@@ -102,6 +102,9 @@ public class NetworkedTrainCar : IdMonoBehaviour<ushort, NetworkedTrainCar>
     private const int MAX_COUPLER_ITERATIONS = 10;
     private const float MAX_PORT_DELTA = 0.001f;
     private const uint MIN_KINEMATIC_CYCLES = 10;
+    // tick == lastTickProcessed duplicates are dropped silently; this handles tick < lastTickProcessed
+    private const uint REGRESSION_RESYNC_THRESHOLD = 24;   // ~1s of consecutive regressions at TICK_RATE
+    private const uint RESYNC_COOLDOWN_TICKS = 120;        // at most one resync request per ~5s per car
     private const float DISTANCE_TOLERANCE = 2f;
     private const float MAX_PAINT_DISTANCE_SQ = (CommsRadioPaintjob.SIGNAL_RANGE + DISTANCE_TOLERANCE) * (CommsRadioPaintjob.SIGNAL_RANGE + DISTANCE_TOLERANCE);
     private const float POSITION_UPDATE_THRESHOLD = 0.1f; // TrainCar must have a bigger delta to apply position update
@@ -160,6 +163,8 @@ public class NetworkedTrainCar : IdMonoBehaviour<ushort, NetworkedTrainCar>
     public uint TicksSinceSync = uint.MaxValue;
 
     public uint lastTickProcessed = 0;
+    private uint consecutiveTickRegressions;
+    private uint lastResyncRequestTick;
     public bool HasPlayers => PlayerManager.Car == TrainCar || GetComponentInChildren<NetworkedPlayer>() != null;
 
     private Bogie bogie1;
@@ -1757,13 +1762,37 @@ public class NetworkedTrainCar : IdMonoBehaviour<ushort, NetworkedTrainCar>
         if (tick <= lastTickProcessed)
         {
             if (tick == lastTickProcessed)
+            {
+                // Duplicate delivery of the current tick — measured at 118.5M log lines
+                // across 54 GRDN sessions (70% of all log output). Not an anomaly worth
+                // logging per packet; count it and move on.
                 GrdnPerf.Count(fromMismatchFallback ? GrdnPerf.Counter.DupTickFallback : GrdnPerf.Counter.DupTickAligned);
-            else
-                GrdnPerf.Count(GrdnPerf.Counter.TickRegression);
-            Multiplayer.LogWarning($"Received physics update for car {CurrentID} at tick {tick}, but last tick processed was {lastTickProcessed}");
+                return;
+            }
+
+            GrdnPerf.Count(GrdnPerf.Counter.TickRegression);
+            consecutiveTickRegressions++;
+
+            // Log the start of a regression burst, then stay quiet — the old per-packet
+            // warning produced multi-GB Player.logs and main-thread I/O at packet rate.
+            if (consecutiveTickRegressions == 1)
+                Multiplayer.LogWarning($"Received physics update for car {CurrentID} at tick {tick}, but last tick processed was {lastTickProcessed}");
+
+            // Persistent regression means this car's tick state is wedged (there is no
+            // other recovery path — lastTickProcessed is never reset). Ask the server to
+            // dirty all state for this car, at most once per RESYNC_COOLDOWN_TICKS.
+            if (consecutiveTickRegressions >= REGRESSION_RESYNC_THRESHOLD &&
+                (tick > lastResyncRequestTick + RESYNC_COOLDOWN_TICKS || lastResyncRequestTick > tick))
+            {
+                lastResyncRequestTick = tick;
+                consecutiveTickRegressions = 0;
+                Multiplayer.LogWarning($"Car {CurrentID}: persistent out-of-order physics updates; requesting train sync");
+                NetworkLifecycle.Instance?.Client?.SendTrainSyncRequest(NetId);
+            }
             return;
         }
 
+        consecutiveTickRegressions = 0;
         lastTickProcessed = tick;
 
         if (movementPart.typeFlag == TrainsetMovementPart.MovementType.RigidBody)
@@ -1820,7 +1849,12 @@ public class NetworkedTrainCar : IdMonoBehaviour<ushort, NetworkedTrainCar>
             client_bogie2Queue.ReceiveSnapshot(movementPart.Bogie2, tick);
         }
 
-        bool kinematic = movementPart.Speed < NetworkTrainsetWatcher.VELOCITY_THRESHOLD && (movementPart.RigidbodySnapshot != null && movementPart.RigidbodySnapshot.Velocity.magnitude < NetworkTrainsetWatcher.VELOCITY_THRESHOLD);
+        // Railed cars never carry a RigidbodySnapshot (only MovementType.RigidBody parts do),
+        // so requiring one made this freeze unreachable for everything on rails — and every
+        // received update (including 2s full-syncs of parked consists) forced isKinematic=false,
+        // fighting the base game's sleep system. Abs() because reverse speed is negative.
+        bool kinematic = Mathf.Abs(movementPart.Speed) < NetworkTrainsetWatcher.VELOCITY_THRESHOLD &&
+            (movementPart.RigidbodySnapshot == null || movementPart.RigidbodySnapshot.Velocity.magnitude < NetworkTrainsetWatcher.VELOCITY_THRESHOLD);
 
         if (kinematic && kinematicCycles < MIN_KINEMATIC_CYCLES)
             kinematicCycles++;
