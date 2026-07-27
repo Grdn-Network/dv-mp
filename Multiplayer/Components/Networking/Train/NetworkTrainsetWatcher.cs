@@ -14,7 +14,19 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
 
     const float DESIRED_FULL_SYNC_INTERVAL = 2f; // in seconds
     const int MAX_UNSYNC_TICKS = (int)(NetworkLifecycle.TICK_RATE * DESIRED_FULL_SYNC_INTERVAL);
+    // A stationary trainset's state does not change between syncs, so its periodic
+    // re-broadcast serves only to heal lost packets. Parked sets re-sync on this longer
+    // interval instead of every 2s; with a large parked fleet the 2s cadence dominates
+    // host send volume. Track changes under a parked set sync immediately instead of
+    // waiting for the timer.
+    const float STATIONARY_FULL_SYNC_INTERVAL = 30f; // in seconds
+    const int STATIONARY_MAX_UNSYNC_TICKS = (int)(NetworkLifecycle.TICK_RATE * STATIONARY_FULL_SYNC_INTERVAL);
     public const float VELOCITY_THRESHOLD = 0.01f;
+
+    // Sync volume heartbeat so a session log shows send rates without a profiler.
+    private int heartbeatPackets;
+    private int heartbeatFullSyncs;
+    private float heartbeatNextLogTime;
 
     protected override void Awake()
     {
@@ -50,14 +62,23 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
             else
                 Multiplayer.LogWarning($"Server_OnTick(): Trainset or cars are null. Set Id: {set?.id}, Cars: {set?.cars?.Count}");
         }
+
+        if (Time.unscaledTime >= heartbeatNextLogTime)
+        {
+            if (heartbeatNextLogTime > 0f)
+                Multiplayer.Log($"Trainset sync heartbeat: {Trainset.allSets.Count} sets, {heartbeatPackets} physics packets, {heartbeatFullSyncs} full syncs in last 60s");
+            heartbeatPackets = 0;
+            heartbeatFullSyncs = 0;
+            heartbeatNextLogTime = Time.unscaledTime + 60f;
+        }
     }
 
     private void Server_TickSet(Trainset set, uint tick)
     {
         bool anyCarMoving = false;
         bool anyCarTeleporting = false;
-        bool maxTicksReached = false;
         bool anyTracksDirty = false;
+        uint maxTicksSinceSync = 0;
 
         if (UnloadWatcher.isUnloading || UnloadWatcher.isQuitting)
             return;
@@ -104,7 +125,8 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
             // If we can locate the networked car, we'll add to the ticks counter and check if any tracks are dirty
             if (NetworkedTrainCar.TryGetFromTrainCar(trainCar, out NetworkedTrainCar netTC) && netTC != null)
             {
-                maxTicksReached |= netTC.TicksSinceSync >= MAX_UNSYNC_TICKS; //Even if the car is stationary, if the max ticks has been exceeded we will still sync
+                if (netTC.TicksSinceSync > maxTicksSinceSync)
+                    maxTicksSinceSync = netTC.TicksSinceSync; //whether this forces a sync depends on the set's stationary state, decided after the loop
                 anyTracksDirty |= netTC.BogieTracksDirty;
             }
             else
@@ -135,13 +157,21 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
             if (anyCarTeleporting)
                 Multiplayer.LogDebug(() => $"Server_TickSet() {trainCar?.ID} in set {set.id} is teleporting");
 
-            // We can finish checking early if we have either a car moving/teleporting or a car not sync'd within the max-tick threshold
-            if (anyCarMoving || anyCarTeleporting || maxTicksReached)
+            // We can finish checking early if we have a car moving or teleporting; a stationary
+            // set needs the full walk so the sync decision below sees every car's tick count
+            // and dirty-track flag
+            if (anyCarMoving || anyCarTeleporting)
             {
-                //Multiplayer.LogDebug(() => $"Server_TickSet() TrainCar {trainCar.ID} ({netTC?.NetId}) from set: {cachedSendPacket.FirstNetId} is moving or due for sync! stationary: {trainCar.isStationary}, RB velocity: {trainCar.rb.velocity} {trainCar.rb.velocity.magnitude}, tracks dirty: {netTC?.BogieTracksDirty} sync: {netTC?.TicksSinceSync >= MAX_UNSYNC_TICKS}");
+                //Multiplayer.LogDebug(() => $"Server_TickSet() TrainCar {trainCar.ID} ({netTC?.NetId}) from set: {cachedSendPacket.FirstNetId} is moving or due for sync! stationary: {trainCar.isStationary}, RB velocity: {trainCar.rb.velocity} {trainCar.rb.velocity.magnitude}, tracks dirty: {netTC?.BogieTracksDirty}");
                 break;
             }
         }
+
+        // Moving sets keep the 2s full-sync cadence; stationary sets stretch to the long
+        // interval and sync immediately when a track under them changed
+        bool maxTicksReached = anyCarMoving
+            ? maxTicksSinceSync >= MAX_UNSYNC_TICKS
+            : maxTicksSinceSync >= STATIONARY_MAX_UNSYNC_TICKS || anyTracksDirty;
 
         // If any car is dirty or exceeded its max ticks we will re-sync the entire train
         if (!anyCarMoving && !maxTicksReached || anyCarTeleporting)
@@ -161,6 +191,11 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
             if (trainCar.derailed)
             {
                 trainsetParts[i] = new TrainsetMovementPart(networkedTrainCar.NetId, RigidbodySnapshot.From(trainCar.rb));
+                // A rigidbody snapshot is a full state send for a derailed car. Without this
+                // reset its tick counter grows forever, which kept any set containing a
+                // stationary wreck broadcasting at full tick rate for the rest of the session
+                if (maxTicksReached)
+                    networkedTrainCar.TicksSinceSync = 0;
             }
             else
             {
@@ -192,6 +227,9 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
         }
 
         cachedSendPacket.TrainsetParts = trainsetParts;
+        heartbeatPackets++;
+        if (maxTicksReached)
+            heartbeatFullSyncs++;
         NetworkLifecycle.Instance.Server.SendTrainsetPhysicsUpdate(cachedSendPacket, anyTracksDirty);
     }
     #endregion
