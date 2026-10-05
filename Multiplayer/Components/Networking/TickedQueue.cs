@@ -9,6 +9,17 @@ public abstract class TickedQueue<T> : MonoBehaviour
     private const float WARNING_THRESHOLD_SECONDS = 3.0f;
     private const uint QUEUE_LENGTH_WARNING = (uint)(NetworkLifecycle.TICK_RATE * WARNING_THRESHOLD_SECONDS);
     private const uint SNAPSHOT_GAP_WARNING = (uint)(NetworkLifecycle.TICK_RATE * WARNING_THRESHOLD_SECONDS);
+    // Both warnings below fire per received snapshot, and there is one queue per car per data type
+    // (speed, rigidbody, each bogie). In a measured client session the gap warning alone accounted
+    // for 59,418 of 100,632 log lines, 59 percent of all output. Both are symptoms of a starved or
+    // desynced tick, but Unity logs synchronously on the main thread, so logging them without bound
+    // becomes a cause of the stalls they report. Each now logs one in N with a running count; the
+    // warning thresholds themselves are unchanged. The counters are static so the sample is one in
+    // N across all queues rather than per queue: with a large fleet there are thousands of queue
+    // instances, and per instance counters would still emit a first occurrence line for each one.
+    private const int SUPPRESSED_LOG_INTERVAL = 1000;
+    private static long queueLengthLogCount;
+    private static long snapshotGapLogCount;
 
     private uint lastTick;
     private uint lastReceivedTick;
@@ -35,11 +46,11 @@ public abstract class TickedQueue<T> : MonoBehaviour
         if (tick <= lastTick)
             return;
 
-        if (snapshots.Count >= QUEUE_LENGTH_WARNING)
-            Multiplayer.LogWarning($"[{GetID()}] Snapshot queue exceeds {QUEUE_LENGTH_WARNING} items. Current size: {snapshots.Count}");
+        if (snapshots.Count >= QUEUE_LENGTH_WARNING && queueLengthLogCount++ % SUPPRESSED_LOG_INTERVAL == 0)
+            Multiplayer.LogWarning($"[{GetID()}] Snapshot queue exceeds {QUEUE_LENGTH_WARNING} items. Current size: {snapshots.Count} (occurrence #{queueLengthLogCount})");
 
-        if (lastReceivedTick > 0 && tick - lastReceivedTick > SNAPSHOT_GAP_WARNING)
-            Multiplayer.LogWarning($"[{GetID()}] Large gap between snapshots: {tick - lastReceivedTick} ticks.");
+        if (lastReceivedTick > 0 && tick - lastReceivedTick > SNAPSHOT_GAP_WARNING && snapshotGapLogCount++ % SUPPRESSED_LOG_INTERVAL == 0)
+            Multiplayer.LogWarning($"[{GetID()}] Large gap between snapshots: {tick - lastReceivedTick} ticks. (occurrence #{snapshotGapLogCount})");
 
         lastReceivedTick = tick;
         lastTick = tick;
