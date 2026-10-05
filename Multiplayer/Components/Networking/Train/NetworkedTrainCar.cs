@@ -106,6 +106,9 @@ public class NetworkedTrainCar : IdMonoBehaviour<ushort, NetworkedTrainCar>
     private const int MAX_COUPLER_ITERATIONS = 50;
     private const float MAX_PORT_DELTA = 0.001f;
     private const uint MIN_KINEMATIC_CYCLES = 10;
+    // tick == lastTickProcessed duplicates are dropped silently; these govern tick < lastTickProcessed
+    private const uint REGRESSION_RESYNC_THRESHOLD = 24;   // ~1s of consecutive regressions at TICK_RATE
+    private const uint RESYNC_COOLDOWN_TICKS = 120;        // at most one resync request per ~5s per car
     private const float DISTANCE_TOLERANCE = 2f;
     private const float MAX_PAINT_DISTANCE_SQ = (CommsRadioPaintjob.SIGNAL_RANGE + DISTANCE_TOLERANCE) * (CommsRadioPaintjob.SIGNAL_RANGE + DISTANCE_TOLERANCE);
     private const float POSITION_UPDATE_THRESHOLD = 0.1f; // TrainCar must have a bigger delta to apply position update
@@ -165,6 +168,8 @@ public class NetworkedTrainCar : IdMonoBehaviour<ushort, NetworkedTrainCar>
     public uint TicksSinceSync = uint.MaxValue;
 
     public uint lastTickProcessed = 0;
+    private uint consecutiveTickRegressions;
+    private uint lastResyncRequestTick;
 
     private Bogie bogie1;
     private Bogie bogie2;
@@ -2144,10 +2149,31 @@ public class NetworkedTrainCar : IdMonoBehaviour<ushort, NetworkedTrainCar>
 
         if (tick <= lastTickProcessed)
         {
-            //Multiplayer.LogWarning($"Received physics update for car {CurrentID} at tick {tick}, but last tick processed was {lastTickProcessed}");
+            // A duplicate delivery of the current tick is not an anomaly, so drop it silently.
+            if (tick == lastTickProcessed)
+                return;
+
+            // A true regression means this car's tick state is wedged. lastTickProcessed is never
+            // reset anywhere, so without a recovery path a wedged car silently drops every further
+            // update for the rest of the session. Ask the server to re-send this car's state.
+            consecutiveTickRegressions++;
+
+            if (consecutiveTickRegressions == 1)
+                Multiplayer.LogWarning($"Received physics update for car {CurrentID} at tick {tick}, but last tick processed was {lastTickProcessed}");
+
+            if (consecutiveTickRegressions >= REGRESSION_RESYNC_THRESHOLD &&
+                (tick > lastResyncRequestTick + RESYNC_COOLDOWN_TICKS || lastResyncRequestTick > tick))
+            {
+                lastResyncRequestTick = tick;
+                consecutiveTickRegressions = 0;
+                Multiplayer.LogWarning($"Car {CurrentID}: persistent out of order physics updates, requesting train sync");
+                NetworkLifecycle.Instance?.Client?.SendTrainSyncRequest(NetId);
+            }
+
             return;
         }
 
+        consecutiveTickRegressions = 0;
         lastTickProcessed = tick;
 
         if (movementPart.typeFlag == TrainsetMovementPart.MovementType.RigidBody)
@@ -2204,7 +2230,12 @@ public class NetworkedTrainCar : IdMonoBehaviour<ushort, NetworkedTrainCar>
             client_bogie2Queue.ReceiveSnapshot(movementPart.Bogie2, tick);
         }
 
-        bool kinematic = movementPart.Speed < NetworkTrainsetWatcher.VELOCITY_THRESHOLD && (movementPart.RigidbodySnapshot != null && movementPart.RigidbodySnapshot.Velocity.magnitude < NetworkTrainsetWatcher.VELOCITY_THRESHOLD);
+        // Railed cars never carry a RigidbodySnapshot (only MovementType.RigidBody parts do), so
+        // requiring one made this freeze unreachable for everything on rails, and every received
+        // update (including the periodic full syncs of parked consists) forced isKinematic=false,
+        // fighting the base game's own sleep system. Abs() because reverse speed is negative.
+        bool kinematic = Mathf.Abs(movementPart.Speed) < NetworkTrainsetWatcher.VELOCITY_THRESHOLD &&
+            (movementPart.RigidbodySnapshot == null || movementPart.RigidbodySnapshot.Velocity.magnitude < NetworkTrainsetWatcher.VELOCITY_THRESHOLD);
 
         if (kinematic && kinematicCycles < MIN_KINEMATIC_CYCLES)
             kinematicCycles++;

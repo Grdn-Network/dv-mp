@@ -26,6 +26,16 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
     public const float VELOCITY_THRESHOLD = 0.01f;
     public const float MAX_POSITION_DELTA = 2f; //if the delta is greater than this we will do a hard correction
 
+    // Mismatch, unknown-set and unable-to-apply warnings fired at packet rate (261k unable-to-apply
+    // and 72k unknown-set lines in a single host session). Log the first occurrence then 1-in-N with
+    // a running count, and resync a desynced set at most once per cooldown window.
+    private const uint MISMATCH_RESYNC_COOLDOWN_TICKS = 120; // ~5s at TICK_RATE
+    private const int SUPPRESSED_LOG_INTERVAL = 1000;
+    private readonly Dictionary<ushort, uint> client_lastMismatchResyncTick = new();
+    private long mismatchLogCount;
+    private long unknownSetLogCount;
+    private long unableToApplyLogCount;
+
     // Sync volume heartbeat so a session log shows send rates without a profiler.
     private int heartbeatPackets;
     private int heartbeatFullSyncs;
@@ -255,7 +265,8 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
 
         if (set == null)
         {
-            Multiplayer.LogWarning($"Received {nameof(ClientboundTrainsetPhysicsPacket)} for unknown trainset with FirstNetId: {packet.FirstNetId} and LastNetId: {packet.LastNetId}");
+            if (unknownSetLogCount++ % SUPPRESSED_LOG_INTERVAL == 0)
+                Multiplayer.LogWarning($"Received {nameof(ClientboundTrainsetPhysicsPacket)} for unknown trainset with FirstNetId: {packet.FirstNetId} and LastNetId: {packet.LastNetId} (occurrence #{unknownSetLogCount})");
             return;
         }
 
@@ -266,6 +277,22 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
             //Multiplayer.LogWarning(
             //    $"Received {nameof(ClientboundTrainsetPhysicsPacket)} for trainset with FirstNetId: {packet.FirstNetId} and LastNetId: {packet.LastNetId} with {packet.TrainsetParts.Length} parts, but trainset has {set.cars.Count} parts");
 
+            // Composition desync never healed on its own: the warning above was silenced and the
+            // packet is best-efforted forever. Log it at a survivable rate, and ask the server to
+            // re-send state for the boundary car so coupling info comes back, at most once per
+            // cooldown window per set.
+            if (mismatchLogCount++ % SUPPRESSED_LOG_INTERVAL == 0)
+                Multiplayer.LogWarning($"Received {nameof(ClientboundTrainsetPhysicsPacket)} for trainset with FirstNetId: {packet.FirstNetId} and LastNetId: {packet.LastNetId} with {packet.TrainsetParts.Length} parts, but trainset has {set.cars.Count} parts (occurrence #{mismatchLogCount})");
+
+            ushort mismatchNetId = (ushort)packet.FirstNetId;
+            if (!client_lastMismatchResyncTick.TryGetValue(mismatchNetId, out uint lastMismatchResync)
+                || packet.Tick > lastMismatchResync + MISMATCH_RESYNC_COOLDOWN_TICKS
+                || lastMismatchResync > packet.Tick)
+            {
+                client_lastMismatchResyncTick[mismatchNetId] = packet.Tick;
+                NetworkLifecycle.Instance?.Client?.SendTrainSyncRequest(mismatchNetId);
+            }
+
             for (int i = 0; i < packet.TrainsetParts.Length; i++)
             {
                 if (NetworkedTrainCar.TryGet(packet.TrainsetParts[i].NetId, out NetworkedTrainCar networkedTrainCar))
@@ -275,7 +302,8 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
                 }
                 else
                 {
-                    Multiplayer.LogWarning($"Unable to apply TrainPhysicsUpdate to {packet.TrainsetParts[i].NetId}, NetworkedTrainCar not found!");
+                    if (unableToApplyLogCount++ % SUPPRESSED_LOG_INTERVAL == 0)
+                        Multiplayer.LogWarning($"Unable to apply TrainPhysicsUpdate to {packet.TrainsetParts[i].NetId}, NetworkedTrainCar not found! (occurrence #{unableToApplyLogCount})");
                 }
             }
             return;
@@ -304,7 +332,8 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
             }
             else
             {
-                Multiplayer.LogWarning($"Unable to apply TrainPhysicsUpdate to {packet.TrainsetParts[i].NetId}, NetworkedTrainCar not found!");
+                if (unableToApplyLogCount++ % SUPPRESSED_LOG_INTERVAL == 0)
+                    Multiplayer.LogWarning($"Unable to apply TrainPhysicsUpdate to {packet.TrainsetParts[i].NetId}, NetworkedTrainCar not found! (occurrence #{unableToApplyLogCount})");
                 missingCars = true;
             }
         }
@@ -322,7 +351,8 @@ public class NetworkTrainsetWatcher : SingletonBehaviour<NetworkTrainsetWatcher>
             if (set.cars[i].TryNetworked(out NetworkedTrainCar networkedTrainCar))
                 networkedTrainCar.Client_ReceiveTrainPhysicsUpdate(in packet.TrainsetParts[i], packet.Tick);
             else
-                Multiplayer.LogWarning($"Unable to apply TrainPhysicsUpdate to TrainSet with FirstNetId: {packet.FirstNetId}, NetworkedTrainCar not found!");
+                if (unableToApplyLogCount++ % SUPPRESSED_LOG_INTERVAL == 0)
+                    Multiplayer.LogWarning($"Unable to apply TrainPhysicsUpdate to TrainSet with FirstNetId: {packet.FirstNetId}, NetworkedTrainCar not found! (occurrence #{unableToApplyLogCount})");
         }
     }
 
